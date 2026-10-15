@@ -1,24 +1,310 @@
 #include "cache.h"
+#include <iostream>
+#include <cmath>
 
+// L1D Stride Pattern Prefetcher (SPP)
+#define IP_TABLE_ENTRIES 64
+#define PT_ENTRIES 512
+#define PT_MASK (PT_ENTRIES - 1)
+#define SIG_BITS 12
+#define SIG_MASK ((1 << SIG_BITS) - 1)
+#define SIG_SHIFT 3
+
+#define UNIFORM_CONF_MAX 7
+#define UNIFORM_CONF_THRESH 2
+
+#define PT_CONF_MAX 7
+#define PT_CONF_THRESH 2
+
+#define FILTER_ENTRIES 256
+#define FILTER_MASK (FILTER_ENTRIES - 1)
+
+#define EPOCH_INTERVAL 512
+
+struct IP_ENTRY {
+    uint64_t ip;
+    uint64_t last_cl_addr;
+    int64_t last_stride;
+    uint16_t signature;
+    uint8_t uniform_conf;
+    uint8_t mode; // 0 = uniform, 1 = non-uniform
+    uint8_t lru;
+    uint8_t valid;
+
+    IP_ENTRY() {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        signature = 0;
+        uniform_conf = 0;
+        mode = 0;
+        lru = 0;
+        valid = 0;
+    }
+};
+
+// pattern table maps signature -> predicted stride
+struct PT_ENTRY {
+    int8_t stride;
+    uint8_t conf;
+
+    PT_ENTRY() {
+        stride = 0;
+        conf = 0;
+    }
+};
+
+// tracks recent prefetches to measure accuracy
+struct FILTER_ENTRY {
+    uint64_t cl_addr;
+    uint8_t useful;
+    uint8_t valid;
+
+    FILTER_ENTRY() {
+        cl_addr = 0;
+        useful = 0;
+        valid = 0;
+    }
+};
+
+static IP_ENTRY ip_table[IP_TABLE_ENTRIES];
+static PT_ENTRY pattern_table[PT_ENTRIES];
+static FILTER_ENTRY pref_filter[FILTER_ENTRIES];
+
+static uint32_t current_degree = 3;
+static uint32_t epoch_prefetches = 0;
+static uint32_t epoch_useful = 0;
+static uint64_t total_prefetches_issued = 0;
+static uint64_t total_useful_prefetches = 0;
+
+static inline uint16_t update_signature(uint16_t sig, int64_t stride) {
+    uint16_t stride_hash = (uint16_t)((stride >= 0 ? (stride & 0x3F) : (((-stride) & 0x3F) | 0x40)));
+    return (uint16_t)(((sig << SIG_SHIFT) ^ stride_hash) & SIG_MASK);
+}
+
+static inline void record_prefetch(uint64_t cl_addr) {
+    uint32_t idx = cl_addr & FILTER_MASK;
+    pref_filter[idx].cl_addr = cl_addr;
+    pref_filter[idx].useful = 0;
+    pref_filter[idx].valid = 1;
+}
+
+static inline void check_useful_hit(uint64_t cl_addr) {
+    uint32_t idx = cl_addr & FILTER_MASK;
+    if (pref_filter[idx].valid && pref_filter[idx].cl_addr == cl_addr && !pref_filter[idx].useful) {
+        pref_filter[idx].useful = 1;
+        epoch_useful++;
+        total_useful_prefetches++;
+    }
+}
+
+// adjust prefetch degree based on recent hit rate
+static void throttle_degree() {
+    if (epoch_prefetches == 0) return;
+    float accuracy = (float)epoch_useful / (float)epoch_prefetches;
+
+    if (accuracy >= 0.70f)
+        current_degree = 4;
+    else if (accuracy >= 0.45f)
+        current_degree = 3;
+    else if (accuracy >= 0.25f)
+        current_degree = 2;
+    else
+        current_degree = 1;
+
+    // decay counters for next epoch
+    epoch_prefetches >>= 1;
+    epoch_useful >>= 1;
+}
 
 void CACHE::l1d_prefetcher_initialize() 
 {
-    std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+    std::cout << "L1D SPP prefetcher initialized" << std::endl;
+
+    for (int i = 0; i < IP_TABLE_ENTRIES; i++) {
+        ip_table[i].lru = i;
+        ip_table[i].valid = 0;
+    }
+    for (int i = 0; i < PT_ENTRIES; i++) {
+        pattern_table[i].stride = 0;
+        pattern_table[i].conf = 0;
+    }
+    for (int i = 0; i < FILTER_ENTRIES; i++) {
+        pref_filter[i].valid = 0;
+    }
+    current_degree = 3;
+    epoch_prefetches = 0;
+    epoch_useful = 0;
+    total_prefetches_issued = 0;
+    total_useful_prefetches = 0;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    if (type == LOAD) {
+        check_useful_hit(cl_addr);
+    }
+
+    // tracker lookup
+    uint64_t masked_ip = ip & 0xFFFF;
+    int match_idx = -1;
+    for (int i = 0; i < IP_TABLE_ENTRIES; i++) {
+        if (ip_table[i].valid && ip_table[i].ip == masked_ip) {
+            match_idx = i;
+            break;
+        }
+    }
+
+    // allocate tracker on miss
+    if (match_idx == -1) {
+        int lru_idx = 0;
+        for (int i = 0; i < IP_TABLE_ENTRIES; i++) {
+            if (!ip_table[i].valid) {
+                lru_idx = i;
+                break;
+            }
+            if (ip_table[i].lru == (IP_TABLE_ENTRIES - 1)) {
+                lru_idx = i;
+            }
+        }
+
+        ip_table[lru_idx].ip = masked_ip;
+        ip_table[lru_idx].last_cl_addr = cl_addr;
+        ip_table[lru_idx].last_stride = 0;
+        ip_table[lru_idx].signature = 0;
+        ip_table[lru_idx].uniform_conf = 0;
+        ip_table[lru_idx].mode = 0;
+        ip_table[lru_idx].valid = 1;
+
+        for (int i = 0; i < IP_TABLE_ENTRIES; i++) {
+            if (ip_table[i].valid && ip_table[i].lru < ip_table[lru_idx].lru)
+                ip_table[i].lru++;
+        }
+        ip_table[lru_idx].lru = 0;
+        return;
+    }
+
+    int64_t stride = (int64_t)cl_addr - (int64_t)ip_table[match_idx].last_cl_addr;
+    if (stride == 0) return;
+
+    if (stride > 127 || stride < -128) {
+        ip_table[match_idx].last_cl_addr = cl_addr;
+        ip_table[match_idx].last_stride = 0;
+        ip_table[match_idx].uniform_conf = 0;
+        return;
+    }
+
+    uint16_t prev_sig = ip_table[match_idx].signature;
+    uint16_t curr_sig = update_signature(prev_sig, stride);
+
+    // train pattern table
+    uint32_t pt_idx = prev_sig & PT_MASK;
+    if (pattern_table[pt_idx].stride == (int8_t)stride) {
+        if (pattern_table[pt_idx].conf < PT_CONF_MAX)
+            pattern_table[pt_idx].conf++;
+    } else {
+        if (pattern_table[pt_idx].conf > 0) {
+            pattern_table[pt_idx].conf--;
+        } else {
+            pattern_table[pt_idx].stride = (int8_t)stride;
+            pattern_table[pt_idx].conf = 1;
+        }
+    }
+
+    // classify stride mode
+    if (stride == ip_table[match_idx].last_stride) {
+        if (ip_table[match_idx].uniform_conf < UNIFORM_CONF_MAX)
+            ip_table[match_idx].uniform_conf++;
+        if (ip_table[match_idx].uniform_conf >= UNIFORM_CONF_THRESH)
+            ip_table[match_idx].mode = 0; // uniform
+    } else {
+        if (ip_table[match_idx].uniform_conf > 0)
+            ip_table[match_idx].uniform_conf--;
+        if (ip_table[match_idx].uniform_conf < UNIFORM_CONF_THRESH)
+            ip_table[match_idx].mode = 1; // non-uniform fallback
+    }
+
+    // generate prefetches
+    if (ip_table[match_idx].mode == 0) {
+        if (ip_table[match_idx].uniform_conf >= UNIFORM_CONF_THRESH) {
+            for (uint32_t d = 1; d <= current_degree; d++) {
+                uint64_t pf_cl_addr = cl_addr + (stride * d);
+                uint64_t pf_address = pf_cl_addr << LOG2_BLOCK_SIZE;
+
+                // page check
+                if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    break;
+
+                int fill_target = (MSHR.occupancy < (MSHR.SIZE >> 1)) ? FILL_L1 : FILL_L2;
+                int issued = prefetch_line(ip, addr, pf_address, fill_target, 0);
+                if (issued) {
+                    record_prefetch(pf_cl_addr);
+                    epoch_prefetches++;
+                    total_prefetches_issued++;
+                }
+            }
+        }
+    } else {
+        uint16_t lookup_sig = curr_sig;
+        uint64_t curr_pf_cl = cl_addr;
+
+        for (uint32_t d = 1; d <= current_degree; d++) {
+            uint32_t lookup_idx = lookup_sig & PT_MASK;
+            if (pattern_table[lookup_idx].conf >= PT_CONF_THRESH && pattern_table[lookup_idx].stride != 0) {
+                int64_t predicted_stride = pattern_table[lookup_idx].stride;
+                curr_pf_cl += predicted_stride;
+                uint64_t pf_address = curr_pf_cl << LOG2_BLOCK_SIZE;
+
+                // page check
+                if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    break;
+
+                int fill_target = (MSHR.occupancy < (MSHR.SIZE >> 1)) ? FILL_L1 : FILL_L2;
+                int issued = prefetch_line(ip, addr, pf_address, fill_target, 0);
+                if (issued) {
+                    record_prefetch(curr_pf_cl);
+                    epoch_prefetches++;
+                    total_prefetches_issued++;
+                }
+
+                lookup_sig = update_signature(lookup_sig, predicted_stride);
+            } else {
+                break;
+            }
+        }
+    }
+
+    ip_table[match_idx].last_cl_addr = cl_addr;
+    ip_table[match_idx].last_stride = stride;
+    ip_table[match_idx].signature = curr_sig;
+
+    // update LRU
+    for (int i = 0; i < IP_TABLE_ENTRIES; i++) {
+        if (ip_table[i].valid && ip_table[i].lru < ip_table[match_idx].lru)
+            ip_table[i].lru++;
+    }
+    ip_table[match_idx].lru = 0;
+
+    // periodic throttling check
+    if (epoch_prefetches >= EPOCH_INTERVAL) {
+        throttle_degree();
+    }
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	return; //metadata_in;
+    return;
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+    std::cout << "CPU " << cpu << " L1D SPP Final Stats:" << std::endl;
+    std::cout << "  Final Prefetch Degree: " << current_degree << std::endl;
+    std::cout << "  Total Prefetches Issued: " << total_prefetches_issued << std::endl;
+    std::cout << "  Total Useful Prefetches: " << total_useful_prefetches << std::endl;
+    if (total_prefetches_issued > 0) {
+        std::cout << "  Calculated Accuracy: " << (100.0 * total_useful_prefetches / total_prefetches_issued) << " %" << std::endl;
+    }
 }
