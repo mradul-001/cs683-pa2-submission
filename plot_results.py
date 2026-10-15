@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-"""Draw every plot used in Summary.pdf from results/all_results.json.
-
-Run run_all_experiments.py first. Plots are written to plots/.
-The "Mean" group of a speedup plot is the geometric mean, all other metrics with the
-arithmetic mean.
-"""
 import json
 import os
 
