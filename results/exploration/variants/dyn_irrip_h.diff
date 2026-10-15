@@ -1,0 +1,11 @@
+--- dyn_irrip.l2c_repl	2026-10-15 10:13:19.542235163 +0530
++++ dyn_irrip_h.l2c_repl	2026-10-15 10:34:37.285685301 +0530
+@@ -185,7 +185,7 @@
+         } else if (active_irrip) {
+             l2_is_pref[set][way] = 0;
+             if (isInstruction) {
+-                l2_rrpv[set][way] = 1;
++                l2_rrpv[set][way] = 0;
+                 l2_is_instr[set][way] = 1;
+             } else {
+                 l2_rrpv[set][way] = maxRRPV - 1;

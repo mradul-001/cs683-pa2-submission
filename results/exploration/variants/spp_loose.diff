@@ -1,0 +1,17 @@
+--- spp.l1d_pref	2026-10-15 10:13:19.541218714 +0530
++++ spp_loose.l1d_pref	2026-10-15 10:30:36.676043520 +0530
+@@ -103,11 +103,11 @@
+     if (epoch_prefetches == 0) return;
+     float accuracy = (float)epoch_useful / (float)epoch_prefetches;
+ 
+-    if (accuracy >= 0.70f)
++    if (accuracy >= 0.55f)
+         current_degree = 4;
+-    else if (accuracy >= 0.45f)
++    else if (accuracy >= 0.30f)
+         current_degree = 3;
+-    else if (accuracy >= 0.25f)
++    else if (accuracy >= 0.15f)
+         current_degree = 2;
+     else
+         current_degree = 1;

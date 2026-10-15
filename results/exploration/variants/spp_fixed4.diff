@@ -1,0 +1,36 @@
+--- spp.l1d_pref	2026-10-15 10:13:19.541218714 +0530
++++ spp_fixed4.l1d_pref	2026-10-15 10:30:36.675710556 +0530
+@@ -71,7 +71,7 @@
+ static PT_ENTRY pattern_table[PT_ENTRIES];
+ static FILTER_ENTRY pref_filter[FILTER_ENTRIES];
+ 
+-static uint32_t current_degree = 3;
++static uint32_t current_degree = 4;
+ static uint32_t epoch_prefetches = 0;
+ static uint32_t epoch_useful = 0;
+ static uint64_t total_prefetches_issued = 0;
+@@ -103,14 +103,7 @@
+     if (epoch_prefetches == 0) return;
+     float accuracy = (float)epoch_useful / (float)epoch_prefetches;
+ 
+-    if (accuracy >= 0.70f)
+-        current_degree = 4;
+-    else if (accuracy >= 0.45f)
+-        current_degree = 3;
+-    else if (accuracy >= 0.25f)
+-        current_degree = 2;
+-    else
+-        current_degree = 1;
++    current_degree = 4; (void)accuracy;
+ 
+     // decay counters for next epoch
+     epoch_prefetches >>= 1;
+@@ -132,7 +125,7 @@
+     for (int i = 0; i < FILTER_ENTRIES; i++) {
+         pref_filter[i].valid = 0;
+     }
+-    current_degree = 3;
++    current_degree = 4;
+     epoch_prefetches = 0;
+     epoch_useful = 0;
+     total_prefetches_issued = 0;

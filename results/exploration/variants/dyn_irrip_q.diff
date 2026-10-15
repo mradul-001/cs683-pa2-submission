@@ -1,0 +1,11 @@
+--- dyn_irrip.l2c_repl	2026-10-15 10:13:19.542235163 +0530
++++ dyn_irrip_q.l2c_repl	2026-10-15 10:42:33.608054602 +0530
+@@ -180,7 +180,7 @@
+             // insert prefetches at maxRRPV so they don't pollute cache
+             prefetch_fills++;
+             l2_is_pref[set][way] = 1;
+-            l2_rrpv[set][way] = maxRRPV;
++            l2_rrpv[set][way] = 1;
+             l2_is_instr[set][way] = isInstruction;
+         } else if (active_irrip) {
+             l2_is_pref[set][way] = 0;

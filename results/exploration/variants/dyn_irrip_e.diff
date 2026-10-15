@@ -1,0 +1,11 @@
+--- dyn_irrip.l2c_repl	2026-10-15 10:13:19.542235163 +0530
++++ dyn_irrip_e.l2c_repl	2026-10-15 10:34:37.285498923 +0530
+@@ -167,7 +167,7 @@
+                 l2_rrpv[set][way] = 0;
+                 l2_is_instr[set][way] = 1;
+             } else {
+-                l2_rrpv[set][way] = 1;
++                l2_rrpv[set][way] = 0;
+             }
+         } else {
+             l2_rrpv[set][way] = 0;

@@ -1,0 +1,11 @@
+--- dyn_irrip.l2c_repl	2026-10-15 10:13:19.542235163 +0530
++++ dyn_irrip_n.l2c_repl	2026-10-15 10:42:33.607923224 +0530
+@@ -175,7 +175,7 @@
+                 l2_is_instr[set][way] = 1;
+         }
+     } else {
+-        bool is_prefetch = (type == PREFETCH);
++        bool is_prefetch = false; (void)PREFETCH;
+         if (is_prefetch) {
+             // insert prefetches at maxRRPV so they don't pollute cache
+             prefetch_fills++;
