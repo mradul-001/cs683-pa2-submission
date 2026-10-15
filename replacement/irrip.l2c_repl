@@ -1,0 +1,117 @@
+#include "cache.h"
+#include <iostream>
+
+// I-RRIP: instruction-conscious L2 replacement policy
+#define maxRRPV 3
+
+static uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+static uint8_t l2_is_instr[L2C_SET][L2C_WAY];
+
+static uint64_t total_insertions = 0;
+static uint64_t instr_insertions = 0;
+static uint64_t data_insertions = 0;
+static uint64_t instr_hits = 0;
+static uint64_t data_hits = 0;
+static uint64_t data_evictions = 0;
+static uint64_t instr_evictions = 0;
+
+void CACHE::l2c_initialize_replacement()
+{
+    std::cout << "L2C I-RRIP initialized" << std::endl;
+
+    for (int i = 0; i < L2C_SET; i++) {
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = 0;
+        }
+    }
+    total_insertions = 0;
+    instr_insertions = 0;
+    data_insertions = 0;
+    instr_hits = 0;
+    data_hits = 0;
+    data_evictions = 0;
+    instr_evictions = 0;
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // check invalid line first
+    for (int i = 0; i < L2C_WAY; i++) {
+        if (!current_set[i].valid) {
+            return i;
+        }
+    }
+
+    while (1) {
+        // try to evict data line with max RRPV first to protect instructions
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV && l2_is_instr[set][i] == 0) {
+                data_evictions++;
+                return i;
+            }
+        }
+
+        // if no data lines at maxRRPV, evict instruction line
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV) {
+                instr_evictions++;
+                return i;
+            }
+        }
+
+        // age lines
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] < maxRRPV) {
+                l2_rrpv[set][i]++;
+            }
+        }
+    }
+
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    if (hit) {
+        // promotion: instructions get RRPV 0, data hits get RRPV 1
+        if (isInstruction || l2_is_instr[set][way]) {
+            l2_rrpv[set][way] = 0;
+            l2_is_instr[set][way] = 1;
+            instr_hits++;
+        } else {
+            l2_rrpv[set][way] = 1;
+            data_hits++;
+        }
+    } else {
+        // insertion: instructions inserted at RRPV 1, data at RRPV 2
+        total_insertions++;
+        if (isInstruction) {
+            l2_rrpv[set][way] = 1;
+            l2_is_instr[set][way] = 1;
+            instr_insertions++;
+        } else {
+            l2_rrpv[set][way] = maxRRPV - 1;
+            l2_is_instr[set][way] = 0;
+            data_insertions++;
+        }
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    std::cout << "CPU " << cpu << " L2C I-RRIP Final Stats:" << std::endl;
+    std::cout << "  Total Insertions: " << total_insertions << std::endl;
+    std::cout << "    Instruction Insertions: " << instr_insertions << std::endl;
+    std::cout << "    Data Insertions: " << data_insertions << std::endl;
+    std::cout << "  Hits:" << std::endl;
+    std::cout << "    Instruction Hits: " << instr_hits << std::endl;
+    std::cout << "    Data Hits: " << data_hits << std::endl;
+    std::cout << "  Evictions:" << std::endl;
+    std::cout << "    Instruction Evictions: " << instr_evictions << std::endl;
+    std::cout << "    Data Evictions: " << data_evictions << std::endl;
+}
