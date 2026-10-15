@@ -1,3 +1,27 @@
+# CS683 PA2 solution
+
+The report with all tables, plots and explanations is **`Summary.pdf`**.
+
+| Task | Implementation |
+|---|---|
+| 1B Stride Pattern Prefetcher | `prefetcher/spp.l1d_pref` |
+| 2A I-RRIP | `replacement/irrip.l2c_repl`; `isInstruction` added to `update_replacement_state` in `inc/cache.h`, `src/cache.cc`, `src/ooo_cpu.cc` and all `replacement/*` files |
+| 2B Dynamic I-RRIP | `replacement/dyn_irrip.l2c_repl` (threshold via `IRRIP_THRESH`, default 0.15) |
+| 3 SPP + prefetch-aware Dynamic I-RRIP | `replacement/dyn_irrip.l2c_repl`, built together with `spp` |
+
+Reproducing the results (put `Trace1.gz`..`Trace3.gz` in `traces/` first):
+
+```bash
+python3 run_all_experiments.py   # builds the binaries, runs all 30 simulations
+python3 plot_results.py          # needs matplotlib; writes plots/
+```
+
+Results: `results/all_results.csv` / `.json`, raw ChampSim output in `results/raw_logs/`,
+plots in `plots/`. Logs of the extra design-exploration runs quoted in the report are in
+`results/exploration/`.
+
+---
+
 # ChampSim
 
 ChampSim is a trace-based simulator for microarchitecture research.
