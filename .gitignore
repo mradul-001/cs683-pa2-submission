@@ -25,7 +25,14 @@ traces/
 *.champsim.xz
 *.trace.xz
 *.trace.gz
+*.gz
 
 __pycache__/
 *.pyc
 .venv/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+._*
