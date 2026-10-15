@@ -18,9 +18,10 @@
 #define maxRRPV 3
 #define NUM_LEADER_SETS 32          // 1 in every 32 of the 1024 L2 sets
 
-// default threshold; can be overridden at run time with IRRIP_THRESH=<value>
+// default threshold (picked from the sensitivity study, see Summary.pdf);
+// can be overridden at run time with IRRIP_THRESH=<value>
 #ifndef IRRIP_THRESHOLD
-#define IRRIP_THRESHOLD 0.25
+#define IRRIP_THRESHOLD 0.15
 #endif
 
 static uint32_t l2_rrpv[L2C_SET][L2C_WAY];

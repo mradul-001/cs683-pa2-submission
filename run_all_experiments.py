@@ -167,12 +167,12 @@ def main():
 
     # Task 3: SPP + dynamic I-RRIP
     for t_name, t_path in TRACES.items():
-        jobs.append(('spp_dyn_irrip', bins['spp_dyn_irrip'], t_name, t_path, {'IRRIP_THRESH': '0.25'}))
+        jobs.append(('spp_dyn_irrip', bins['spp_dyn_irrip'], t_name, t_path, {'IRRIP_THRESH': '0.15'}))
 
     print(f"Total jobs to execute: {len(jobs)}")
     
     results = {}
-    with ProcessPoolExecutor(max_workers=8) as executor:
+    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
         futures = {executor.submit(run_single_simulation, job): job for job in jobs}
         for future in as_completed(futures):
             name, trace_name, data = future.result()
