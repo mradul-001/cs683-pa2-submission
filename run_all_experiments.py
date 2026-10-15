@@ -6,28 +6,18 @@ import json
 import csv
 import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import numpy as np
 
 WARMUP = 25000000
 SIM = 25000000
 
-TRACES = {
-    'Trace1': 'traces/Trace1.gz',
-    'Trace2': 'traces/Trace2.gz',
-    'Trace3': 'traces/Trace3.gz'
-}
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TRACES = {t: os.path.join(BASE_DIR, 'traces', f'{t}.gz') for t in ['Trace1', 'Trace2', 'Trace3']}
+
 RESULTS_DIR = os.path.join(BASE_DIR, 'results')
 LOGS_DIR = os.path.join(RESULTS_DIR, 'raw_logs')
-PLOTS_DIR = os.path.join(BASE_DIR, 'plots')
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
-os.makedirs(PLOTS_DIR, exist_ok=True)
 
 def parse_champsim_log(text):
     data = {}
@@ -136,38 +126,49 @@ def run_single_simulation(job):
         print(f"[ERROR] Failed {name} on {trace_name}: {e}")
         return name, trace_name, {}
 
+# config name -> (L1D prefetcher, L2C replacement, binary suffix) for build_champsim.sh
+BUILDS = {
+    'baseline':      ('no',       'lru',       'baseline'),
+    'ip_stride':     ('ip_stride', 'lru',      'ip_stride'),
+    'spp':           ('spp',      'lru',       'spp'),
+    'irrip':         ('no',       'irrip',     'irrip'),
+    'dyn_irrip':     ('no',       'dyn_irrip', 'dyn_irrip'),
+    'spp_dyn_irrip': ('spp',      'dyn_irrip', 'spp_dyn_irrip'),
+}
+
+def binary(build):
+    """Path of the ChampSim binary for a build, building it if it is missing."""
+    pref, repl, suffix = BUILDS[build]
+    path = os.path.join(BASE_DIR, 'bin',
+        f"hashed_perceptron-no-{pref}-no-no-no-no-no-lru-lru-lru-{repl}-lru-lru-lru-lru-1core-{suffix}")
+    if not os.path.exists(path):
+        print(f"[BUILD] {build}")
+        subprocess.run(['./build_champsim.sh', pref, repl, suffix], cwd=BASE_DIR, check=True,
+                       stdout=subprocess.DEVNULL)
+    return path
+
 def main():
     jobs = []
-    
-    # 1. Baseline
-    for t_name, t_path in TRACES.items():
-        jobs.append(('baseline', './bin/champsim_baseline', t_name, t_path, None))
-        
-    # 2. IP Stride
-    for t_name, t_path in TRACES.items():
-        jobs.append(('ip_stride', './bin/champsim_ip_stride', t_name, t_path, None))
-        
-    # 3. SPP
-    for t_name, t_path in TRACES.items():
-        jobs.append(('spp', './bin/champsim_spp', t_name, t_path, None))
-        
-    # 4. I-RRIP
-    for t_name, t_path in TRACES.items():
-        jobs.append(('irrip', './bin/champsim_irrip', t_name, t_path, None))
-        
-    # 5. Dynamic I-RRIP (default threshold = 0.25)
-    for t_name, t_path in TRACES.items():
-        jobs.append(('dyn_irrip_0.25', './bin/champsim_dyn_irrip', t_name, t_path, {'IRRIP_THRESH': '0.25'}))
-        
-    # 6. Dynamic I-RRIP sensitivity study (5 thresholds: 0.15, 0.20, 0.25, 0.30, 0.35)
-    for thresh in ['0.15', '0.20', '0.30', '0.35']:
+    bins = {b: binary(b) for b in BUILDS}
+
+    # Task 1: baseline, IP-stride and SPP
+    for cfg in ['baseline', 'ip_stride', 'spp']:
         for t_name, t_path in TRACES.items():
-            jobs.append((f'dyn_irrip_{thresh}', './bin/champsim_dyn_irrip', t_name, t_path, {'IRRIP_THRESH': thresh}))
-            
-    # 7. SPP + Dynamic I-RRIP (Task 3)
+            jobs.append((cfg, bins[cfg], t_name, t_path, None))
+
+    # Task 2A: I-RRIP
     for t_name, t_path in TRACES.items():
-        jobs.append(('spp_dyn_irrip', './bin/champsim_spp_dyn_irrip', t_name, t_path, {'IRRIP_THRESH': '0.25'}))
-        
+        jobs.append(('irrip', bins['irrip'], t_name, t_path, None))
+
+    # Task 2B: dynamic I-RRIP, sensitivity study over 5 thresholds
+    for thresh in ['0.15', '0.20', '0.25', '0.30', '0.35']:
+        for t_name, t_path in TRACES.items():
+            jobs.append((f'dyn_irrip_{thresh}', bins['dyn_irrip'], t_name, t_path, {'IRRIP_THRESH': thresh}))
+
+    # Task 3: SPP + dynamic I-RRIP
+    for t_name, t_path in TRACES.items():
+        jobs.append(('spp_dyn_irrip', bins['spp_dyn_irrip'], t_name, t_path, {'IRRIP_THRESH': '0.25'}))
+
     print(f"Total jobs to execute: {len(jobs)}")
     
     results = {}
