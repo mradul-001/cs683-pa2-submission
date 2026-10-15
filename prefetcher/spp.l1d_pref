@@ -3,24 +3,36 @@
 #include <cmath>
 
 // L1D Stride Pattern Prefetcher (SPP)
+//
+// Every load IP gets an entry in the IP table. While the IP keeps repeating the
+// same stride it stays in uniform mode and we prefetch stride*1..stride*degree,
+// like IP-stride. Once the stride keeps changing, the IP falls back to
+// non-uniform mode: its recent strides are hashed into a signature, and the
+// pattern table (signature -> next stride) is walked to prefetch ahead.
+// A small filter of recently prefetched lines measures accuracy, and the
+// degree is raised or lowered every epoch based on it.
+// Prefetches never cross the 4 KB page of the triggering access.
+
 #define IP_TABLE_ENTRIES 64
 #define PT_ENTRIES 512
 #define PT_MASK (PT_ENTRIES - 1)
 #define SIG_BITS 12
 #define SIG_MASK ((1 << SIG_BITS) - 1)
-#define SIG_SHIFT 3
+#define SIG_SHIFT 3                 // 12-bit signature keeps ~4 strides of history
 
-#define UNIFORM_CONF_MAX 7
-#define UNIFORM_CONF_THRESH 2
+#define UNIFORM_CONF_MAX 7          // 3-bit saturating counter
+#define UNIFORM_CONF_THRESH 2       // same stride seen twice in a row -> uniform
 
 #define PT_CONF_MAX 7
-#define PT_CONF_THRESH 2
+#define PT_CONF_THRESH 2            // only follow a PT entry once it repeated
 
 #define FILTER_ENTRIES 256
 #define FILTER_MASK (FILTER_ENTRIES - 1)
 
-#define EPOCH_INTERVAL 512
+#define EPOCH_INTERVAL 512          // re-evaluate degree every 512 prefetches
 
+// One entry per tracked IP. Fields are wider here than in hardware;
+// the storage breakdown in the report uses the real bit widths.
 struct IP_ENTRY {
     uint64_t ip;
     uint64_t last_cl_addr;
@@ -54,7 +66,8 @@ struct PT_ENTRY {
     }
 };
 
-// tracks recent prefetches to measure accuracy
+// Direct-mapped record of recently prefetched lines. A demand load that finds
+// its line here (and not yet marked useful) counts as one useful prefetch.
 struct FILTER_ENTRY {
     uint64_t cl_addr;
     uint8_t useful;
@@ -77,6 +90,8 @@ static uint32_t epoch_useful = 0;
 static uint64_t total_prefetches_issued = 0;
 static uint64_t total_useful_prefetches = 0;
 
+// Fold a stride into the signature. The stride is squeezed into 7 bits
+// (6-bit magnitude + sign bit) so +3 and -3 hash differently.
 static inline uint16_t update_signature(uint16_t sig, int64_t stride) {
     uint16_t stride_hash = (uint16_t)((stride >= 0 ? (stride & 0x3F) : (((-stride) & 0x3F) | 0x40)));
     return (uint16_t)(((sig << SIG_SHIFT) ^ stride_hash) & SIG_MASK);
@@ -98,7 +113,10 @@ static inline void check_useful_hit(uint64_t cl_addr) {
     }
 }
 
-// adjust prefetch degree based on recent hit rate
+// Pick the degree from the accuracy of the last epoch. Above 70% almost every
+// prefetch is used, so we can run further ahead; below 25% most prefetches
+// are pollution, so we drop to a single prefetch. The bands are explained in
+// the report (Task 1, throttling).
 static void throttle_degree() {
     if (epoch_prefetches == 0) return;
     float accuracy = (float)epoch_useful / (float)epoch_prefetches;
@@ -112,7 +130,7 @@ static void throttle_degree() {
     else
         current_degree = 1;
 
-    // decay counters for next epoch
+    // halve instead of reset, so the next decision still remembers this epoch
     epoch_prefetches >>= 1;
     epoch_useful >>= 1;
 }
@@ -143,11 +161,12 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 {
     uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
 
+    // accuracy bookkeeping: was this demand load covered by a prefetch?
     if (type == LOAD) {
         check_useful_hit(cl_addr);
     }
 
-    // tracker lookup
+    // IP table lookup, 16-bit partial tag
     uint64_t masked_ip = ip & 0xFFFF;
     int match_idx = -1;
     for (int i = 0; i < IP_TABLE_ENTRIES; i++) {
@@ -157,7 +176,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
     }
 
-    // allocate tracker on miss
+    // new IP: take an invalid entry or the LRU one; nothing to predict yet
     if (match_idx == -1) {
         int lru_idx = 0;
         for (int i = 0; i < IP_TABLE_ENTRIES; i++) {
@@ -189,6 +208,8 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     int64_t stride = (int64_t)cl_addr - (int64_t)ip_table[match_idx].last_cl_addr;
     if (stride == 0) return;
 
+    // strides must fit the 8-bit field; a bigger jump means the IP moved to a
+    // new region, so restart its training
     if (stride > 127 || stride < -128) {
         ip_table[match_idx].last_cl_addr = cl_addr;
         ip_table[match_idx].last_stride = 0;
@@ -199,7 +220,9 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     uint16_t prev_sig = ip_table[match_idx].signature;
     uint16_t curr_sig = update_signature(prev_sig, stride);
 
-    // train pattern table
+    // train the pattern table: the history before this access (prev_sig)
+    // should predict the stride we just saw. Replace the stride only once
+    // its confidence has drained to 0, so one odd stride does not wipe it.
     uint32_t pt_idx = prev_sig & PT_MASK;
     if (pattern_table[pt_idx].stride == (int8_t)stride) {
         if (pattern_table[pt_idx].conf < PT_CONF_MAX)
@@ -213,7 +236,9 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
     }
 
-    // classify stride mode
+    // classify the IP: a repeated stride builds confidence towards uniform
+    // mode, a changed stride drains it. Below the threshold we fall back to
+    // the signature path. Uniform wins whenever it is confident enough.
     if (stride == ip_table[match_idx].last_stride) {
         if (ip_table[match_idx].uniform_conf < UNIFORM_CONF_MAX)
             ip_table[match_idx].uniform_conf++;
@@ -227,7 +252,10 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     }
 
     // generate prefetches
+    // Fill into L1 only while the L1D MSHR is less than half full; otherwise
+    // fill only into L2 so prefetches do not block demand misses.
     if (ip_table[match_idx].mode == 0) {
+        // uniform: cl + stride, cl + 2*stride, ...
         if (ip_table[match_idx].uniform_conf >= UNIFORM_CONF_THRESH) {
             for (uint32_t d = 1; d <= current_degree; d++) {
                 uint64_t pf_cl_addr = cl_addr + (stride * d);
@@ -247,6 +275,10 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             }
         }
     } else {
+        // non-uniform: walk the pattern table. Each predicted stride is folded
+        // into a speculative signature to predict the one after it, so with
+        // (+1,+2,+2,+2,+3) we can prefetch several steps of the sequence.
+        // Stop at the first low-confidence entry.
         uint16_t lookup_sig = curr_sig;
         uint64_t curr_pf_cl = cl_addr;
 
@@ -287,7 +319,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     }
     ip_table[match_idx].lru = 0;
 
-    // periodic throttling check
+    // end of epoch: re-pick the degree from measured accuracy
     if (epoch_prefetches >= EPOCH_INTERVAL) {
         throttle_degree();
     }

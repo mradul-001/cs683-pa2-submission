@@ -337,7 +337,8 @@ class CACHE : public MEMORY {
 		 stlb_initialize_replacement(),
 
 
-
+         // isInstruction (Task 2A): 1 if the line holds code, so the L2 policy
+         // can tell instruction lines from data lines. Defaults to 0 for the others.
          (CACHE::*update_replacement_state)(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction),
 
 

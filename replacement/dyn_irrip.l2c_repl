@@ -3,18 +3,31 @@
 #include <cstdlib>
 
 // Dynamic I-RRIP: set-dueling replacement with SPP prefetch awareness
+//
+// Task 2B: 32 leader sets always run plain SRRIP and count how many of their
+// accesses and misses are instruction fetches. Every other set (follower)
+// runs I-RRIP while instructions are a large enough share of that traffic:
+//     (instr accesses + instr misses) / (all accesses + all misses) >= threshold
+// and plain SRRIP otherwise. The leaders run the unbiased policy, so the
+// metric is not skewed by the decision it drives.
+//
+// Task 3: lines brought in by a prefetch are marked with l2_is_pref. They are
+// inserted at maxRRPV and are the first victims while still unreferenced, so
+// a useless prefetch can only displace another dead line. The first demand
+// hit clears the mark and the line is then treated like any other line.
 #define maxRRPV 3
-#define NUM_LEADER_SETS 32
+#define NUM_LEADER_SETS 32          // 1 in every 32 of the 1024 L2 sets
 
+// default threshold; can be overridden at run time with IRRIP_THRESH=<value>
 #ifndef IRRIP_THRESHOLD
 #define IRRIP_THRESHOLD 0.25
 #endif
 
 static uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 static uint8_t l2_is_instr[L2C_SET][L2C_WAY];
-static uint8_t l2_is_pref[L2C_SET][L2C_WAY];
+static uint8_t l2_is_pref[L2C_SET][L2C_WAY];    // brought by prefetch, not yet used
 
-// leader set counters for set dueling
+// leader set counters for set dueling (halved periodically, see below)
 static uint64_t leader_instr_accesses = 0;
 static uint64_t leader_instr_misses = 0;
 static uint64_t leader_total_accesses = 0;
@@ -27,15 +40,16 @@ static uint64_t prefetch_hits = 0;
 
 static double decision_threshold = IRRIP_THRESHOLD;
 
+// leader sets are spread evenly: sets 0, 32, 64, ...
 static inline bool is_leader_set(uint32_t set) {
     return ((set % (L2C_SET / NUM_LEADER_SETS)) == 0);
 }
 
-// compute metric from leader set stats
+// true when followers should prioritise instruction lines
 static inline bool is_irrip_mode() {
     uint64_t total = leader_total_accesses + leader_total_misses;
     if (total < 64) {
-        return true; // default during warmup
+        return true; // too few samples to judge yet, start in I-RRIP mode
     }
     double metric = (double)(leader_instr_accesses + leader_instr_misses) / (double)total;
     return (metric >= decision_threshold);
@@ -82,7 +96,8 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
 
     while (1) {
         if (use_irrip) {
-            // prioritize unreferenced prefetches, then data, then instruction
+            // I-RRIP victim order at maxRRPV:
+            // unused prefetch, then data line, then instruction line
             for (int i = 0; i < L2C_WAY; i++) {
                 if (l2_rrpv[set][i] == maxRRPV && l2_is_pref[set][i] == 1) {
                     return i;
@@ -99,7 +114,7 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
                 }
             }
         } else {
-            // standard RRIP victim search
+            // SRRIP victim search, still evicting unused prefetches first
             for (int i = 0; i < L2C_WAY; i++) {
                 if (l2_rrpv[set][i] == maxRRPV && l2_is_pref[set][i] == 1) {
                     return i;
@@ -129,7 +144,7 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     if ((type == WRITEBACK) && ip)
         assert(0);
 
-    // leader sets run RRIP and track stats
+    // leader sets run SRRIP and collect the instruction-share statistics
     if (is_leader_set(set)) {
         leader_total_accesses++;
         if (isInstruction)
@@ -139,7 +154,8 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
             if (isInstruction)
                 leader_instr_misses++;
         }
-        // decay leader stats periodically
+        // halve all counters every 16K events so the metric follows the
+        // current program phase rather than the whole run
         if ((leader_total_accesses + leader_total_misses) >= 16384) {
             leader_total_accesses >>= 1;
             leader_total_misses >>= 1;
@@ -156,7 +172,8 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     bool active_irrip = !is_leader_set(set) && is_irrip_mode();
 
     if (hit) {
-        // prefetch hit turns block into demand
+        // a demand hit on a prefetched line: the prefetch was useful,
+        // from now on treat it as a normal line
         if (l2_is_pref[set][way]) {
             prefetch_hits++;
             l2_is_pref[set][way] = 0;
@@ -170,6 +187,7 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
                 l2_rrpv[set][way] = 1;
             }
         } else {
+            // SRRIP: any hit is promoted to RRPV 0
             l2_rrpv[set][way] = 0;
             if (isInstruction)
                 l2_is_instr[set][way] = 1;
@@ -177,12 +195,14 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     } else {
         bool is_prefetch = (type == PREFETCH);
         if (is_prefetch) {
-            // insert prefetches at maxRRPV so they don't pollute cache
+            // prefetched line: insert as the next victim. If it is used
+            // before then, the hit above clears the mark and promotes it.
             prefetch_fills++;
             l2_is_pref[set][way] = 1;
             l2_rrpv[set][way] = maxRRPV;
             l2_is_instr[set][way] = isInstruction;
         } else if (active_irrip) {
+            // demand fill in I-RRIP mode: same insertion as irrip.l2c_repl
             l2_is_pref[set][way] = 0;
             if (isInstruction) {
                 l2_rrpv[set][way] = 1;
@@ -192,6 +212,7 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
                 l2_is_instr[set][way] = 0;
             }
         } else {
+            // demand fill in SRRIP mode (and in leader sets)
             l2_is_pref[set][way] = 0;
             l2_rrpv[set][way] = maxRRPV - 1;
             l2_is_instr[set][way] = isInstruction;

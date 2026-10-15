@@ -2,10 +2,20 @@
 #include <iostream>
 
 // I-RRIP: instruction-conscious L2 replacement policy
+//
+// SRRIP with a 2-bit RRPV, biased towards instruction lines in all three steps:
+//   insertion - instruction lines enter at RRPV 1, data at RRPV 2
+//   promotion - instruction hits go to RRPV 0, data hits only to RRPV 1
+//   eviction  - among lines at maxRRPV, a data line is evicted before an
+//               instruction line
+// An L2 instruction miss stalls the frontend and the OoO core cannot hide it,
+// while many data misses overlap with other work. That is why the bias goes
+// towards instruction lines. Data lines still age normally, so a data-heavy
+// set is not starved.
 #define maxRRPV 3
 
 static uint32_t l2_rrpv[L2C_SET][L2C_WAY];
-static uint8_t l2_is_instr[L2C_SET][L2C_WAY];
+static uint8_t l2_is_instr[L2C_SET][L2C_WAY];   // 1 bit per line: holds code?
 
 static uint64_t total_insertions = 0;
 static uint64_t instr_insertions = 0;
@@ -52,7 +62,7 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
             }
         }
 
-        // if no data lines at maxRRPV, evict instruction line
+        // only instruction lines are at maxRRPV: they really are dead, evict one
         for (int i = 0; i < L2C_WAY; i++) {
             if (l2_rrpv[set][i] == maxRRPV) {
                 instr_evictions++;
@@ -60,7 +70,7 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
             }
         }
 
-        // age lines
+        // nothing at maxRRPV yet: age every line and search again (as in SRRIP)
         for (int i = 0; i < L2C_WAY; i++) {
             if (l2_rrpv[set][i] < maxRRPV) {
                 l2_rrpv[set][i]++;
@@ -78,7 +88,8 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
         assert(0);
 
     if (hit) {
-        // promotion: instructions get RRPV 0, data hits get RRPV 1
+        // promotion: instructions get RRPV 0, data hits get RRPV 1.
+        // A line stays marked as code once any instruction fetch touched it.
         if (isInstruction || l2_is_instr[set][way]) {
             l2_rrpv[set][way] = 0;
             l2_is_instr[set][way] = 1;
@@ -88,7 +99,8 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
             data_hits++;
         }
     } else {
-        // insertion: instructions inserted at RRPV 1, data at RRPV 2
+        // insertion: instructions at RRPV 1 survive one more aging round than
+        // data at RRPV 2 (the normal SRRIP insertion point)
         total_insertions++;
         if (isInstruction) {
             l2_rrpv[set][way] = 1;
